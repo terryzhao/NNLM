@@ -349,10 +349,8 @@ def model_fn(features, labels, mode, params):
         mask * label_probability, axis=0) /
         tf.reduce_sum(mask, axis=0))
     perplexity = tf.exp(sentence_log_probability, name='perplexity')
-    # TODO
-    # average_entropy = tf.metrics.mean(
-    #     sentence_log_probability, weights=tf.reduce_sum(mask, axis=0))
-    average_entropy = tf.metrics.mean(loss)
+    average_entropy = tf.metrics.mean(
+        sentence_log_probability, weights=tf.reduce_sum(mask, axis=0))
 
     # evaluation mode
     eval_metric_ops = {
@@ -482,7 +480,7 @@ def main():
     perplexity = result['perplexity']
     entropy = result['average_entropy']
     np.savetxt('/'.join([param.exp_path, 'eval.perplexity']), perplexity, fmt='%.10f')
-    logger.info('Perplexity is %f' % float(np.exp(entropy)))
+    logger.info('Evaluation perplexity is %f' % float(np.exp(entropy)))
 
 
 class WarningFilter(logging.Filter):
