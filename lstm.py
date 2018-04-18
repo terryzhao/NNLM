@@ -200,7 +200,8 @@ def load_pretrained_embeddings(path, param):
     logger.info('Checking unfound tokens')
     for token in param.dico.keys() - found_tokens:
         logger.info('Cannot load pretrained embedding for token %s' % token)
-        embedding[param.dico[token]] = np.random.uniform(low=-0.25, high=0.25, size=param.emb_dim)
+        embedding[param.dico[token]] = np.random.uniform(
+            low=-0.25, high=0.25, size=param.emb_dim)
 
     logger.info('Finish loading pretrained embedding')
     return tf.convert_to_tensor(embedding, dtype=tf.float32)
@@ -272,34 +273,82 @@ def model_fn(features, labels, mode, params):
     hidden_state = tf.tile(h0, [batch_size, 1])
     state = {'state': (cell_state, hidden_state)}
 
-    # unroll lstm
-    if mode == tf.estimator.ModeKeys.PREDICT:
-        pass
+    # proj weight
+    if params['hidden_proj_dim'] is not None:
+        proj_w = tf.Variable(initial_value=initializer(
+            shape=[params['state_dim'], params['hidden_proj_dim']]))
+        softmax_dim = params['hidden_proj_dim']
     else:
-        def lstm_step(current_step):
+        softmax_dim = params['state_dim']
+
+    # softmax weight
+    softmax_w = tf.Variable(initial_value=initializer(
+        shape=[softmax_dim, params['dico_size']]))
+    softmax_b = tf.Variable(
+        initial_value=tf.zeros(shape=[params['dico_size']]))
+
+    # predict mode (sentence generation)
+    if mode == tf.estimator.ModeKeys.PREDICT:
+        logger.info('LSTM using last prediction')
+        tf.assert_equal(batch_size, 1)
+
+        # embedding reshape
+        embeddings = tf.reshape(
+            embeddings, shape=[params['max_sentence_length'], params['emb_dim']])
+
+        # store output in state
+        state['input_generated'] = tf.constant(False)
+        state['step'] = 0
+        def lstm_predict(current_step):
+            # is current_step EOS?
+            state['input_generated'] = tf.logical_or(
+                state['input_generated'],
+                tf.equal(features[state['step']][0], params['dico'][EOS])
+            )
+
+            # use either current_step or last output
+            current_step = tf.cond(
+                state['input_generated'],
+                lambda: tf.nn.embedding_lookup(
+                    params=embedding_params,
+                    ids=state.get('output', 0)
+                ),
+                lambda: current_step
+            )
+            current_step = tf.reshape(current_step, shape=[1, params['emb_dim']])
+
+            # update step
             output, state['state'] = lstm(current_step, state['state'])
-            return output
-        output = tf.map_fn(fn=lstm_step, elems=embeddings)
+            state['step'] += 1
+
+            # softmax
+            if params['hidden_proj_dim'] is not None:
+                output = tf.matmul(output, proj_w)
+            output = tf.nn.xw_plus_b(output, softmax_w, softmax_b)
+            state['output'] = tf.reshape(
+                tf.cast(tf.argmax(output, axis=1), tf.int32), shape=())
+            
+            return state['output']
+        predictions = {'predictions': tf.reshape(
+            tf.map_fn(lstm_predict, elems=embeddings, dtype=tf.int32), shape=[1, -1])}
+        return tf.estimator.EstimatorSpec(mode=mode, predictions=predictions)
+
+    # unroll lstm
+    logger.info('LSTM using ground truth.')
+    def lstm_step(current_step):
+        output, state['state'] = lstm(current_step, state['state'])
+        return output
+    output = tf.map_fn(fn=lstm_step, elems=embeddings)
 
     # output projection
     output = tf.reshape(output, shape=[-1, params['state_dim']])
     if params['hidden_proj_dim'] is not None:
         logger.info('Project lstm output to %d dim' %
                     params['hidden_proj_dim'])
-        output = tf.layers.dense(
-            inputs=output,
-            units=params['hidden_proj_dim'],
-            activation=None,
-            use_bias=False,
-            kernel_initializer=initializer
-        )
+        output = tf.matmul(output, proj_w)
 
     # logits
-    logits = tf.layers.dense(
-        inputs=output,
-        units=params['dico_size'],
-        kernel_initializer=initializer
-    )
+    logits = tf.nn.xw_plus_b(output, softmax_w, softmax_b)
     logits = tf.reshape(
         logits,
         shape=[params['max_sentence_length'], -1, params['dico_size']]
@@ -307,15 +356,6 @@ def model_fn(features, labels, mode, params):
 
     # prediction
     predict_index = tf.argmax(input=logits, axis=2)
-    predict_probability = tf.nn.softmax(logits, name='softmax')
-    predictions = {
-        'index': predict_index,
-        'probability': tf.reduce_max(predict_probability, axis=2),
-    }
-
-    # prediction mode
-    if mode == tf.estimator.ModeKeys.PREDICT:
-        return tf.estimator.EstimatorSpec(mode=mode, predictions=predictions)
 
     # loss
     loss = tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=logits)
@@ -356,7 +396,7 @@ def model_fn(features, labels, mode, params):
     eval_metric_ops = {
         'accuracy': tf.metrics.accuracy(
             labels=labels,
-            predictions=predictions['index']
+            predictions=predict_index
         ),
         'perplexity': tf.contrib.metrics.streaming_concat(perplexity),
         'average_entropy': average_entropy
@@ -385,6 +425,8 @@ def main():
                         help='Path to training corpus')
     parser.add_argument('--eval_corpus', type=str, default='data/sentences.eval',
                         help='Path to evaluation corpus')
+    parser.add_argument('--conti_corpus', type=str, default=None,
+                        help='Path to sentence continuation corpus')
     parser.add_argument('--max_line_cnt', type=int, default=None,
                         help='Maximum number of lines to load, default None')
     parser.add_argument('--max_sentence_length', type=int, default=30,
@@ -409,6 +451,10 @@ def main():
     # parameter validation
     if param.pretrained is not None:
         assert os.path.exists(param.pretrained)
+    assert os.path.exists(param.train_corpus)
+    assert os.path.exists(param.eval_corpus)
+    if param.conti_corpus is not None:
+        assert os.path.exists(param.conti_corpus)
     assert param.vocab_size > 4  # <bos>, <eos>, <pad>, <unk>
 
     # experiment path
@@ -481,6 +527,37 @@ def main():
     entropy = result['average_entropy']
     np.savetxt('/'.join([param.exp_path, 'eval.perplexity']), perplexity, fmt='%.10f')
     logger.info('Evaluation perplexity is %f' % float(np.exp(entropy)))
+
+    # sentence continuation
+    if param.conti_corpus is not None:
+        logger.info('Sentence continuation start')
+
+        # build inverse dictionary
+        inverse_dico = {v: k for k, v in dico.items()}
+
+        # load and transform corpus
+        conti_corpus = load_corpus(param.conti_corpus, param)
+        conti_corpus = transform_corpus(conti_corpus,
+            dico, param)[:, :-1] # remove extra PAD
+        conti_input_fn = tf.estimator.inputs.numpy_input_fn(
+            x={'x': conti_corpus}, batch_size=1, num_epochs=1, shuffle=False)
+
+        # predict
+        sentences = []
+        for i, result in enumerate(language_model.predict(input_fn=conti_input_fn)):
+            result = result['predictions']
+            # find EOS position
+            eos_pos = 0
+            while conti_corpus[i, eos_pos] != dico[EOS]:
+                eos_pos += 1
+            conti_corpus[i, eos_pos:] = result[eos_pos:]
+            sentences.append([inverse_dico[idx] for idx in conti_corpus[i]])
+
+        # output
+        logger.info('Writing to output file')
+        with open('/'.join([param.exp_path, 'continuation.txt']), 'w') as f:
+            for s in sentences:
+                f.write(' '.join(s)+'\n')
 
 
 class WarningFilter(logging.Filter):
