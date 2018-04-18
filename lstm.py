@@ -230,7 +230,7 @@ def model_fn(features, labels, mode, params):
     features = tf.transpose(features['x'])
     batch_size = tf.shape(features)[1]
     if mode != tf.estimator.ModeKeys.PREDICT:
-        labels = tf.transpose(labels)
+        labels = tf.transpose(labels, name='labels')
 
     # embedding params
     if params['pretrained'] is not None and mode == tf.estimator.ModeKeys.TRAIN:
@@ -247,10 +247,16 @@ def model_fn(features, labels, mode, params):
             logger.info('No pretrained embedding')
         else:
             logger.info('In EVAL mode, loading fine tuned embedding')
+        # embedding_params = tf.Variable(
+        #     initial_value=initializer(
+        #         shape=[params['dico_size'], params['emb_dim']]
+        #     ),
+        #     trainable=True
+        # )
+        # TODO
         embedding_params = tf.Variable(
-            initial_value=initializer(
-                shape=[params['dico_size'], params['emb_dim']]
-            ),
+            initial_value=tf.Variable(tf.random_uniform(
+                [params['dico_size'], params['emb_dim']], -0.25, 0.25)),
             trainable=True
         )
 
@@ -267,10 +273,15 @@ def model_fn(features, labels, mode, params):
     )
 
     # initial state
-    c0 = tf.Variable(initializer(shape=[1, params['state_dim']]))
-    h0 = tf.Variable(initializer(shape=[1, params['state_dim']]))
-    cell_state = tf.tile(c0, [batch_size, 1])
-    hidden_state = tf.tile(h0, [batch_size, 1])
+    # TODO
+    # c0 = tf.Variable(initializer(shape=[1, params['state_dim']]))
+    # h0 = tf.Variable(initializer(shape=[1, params['state_dim']]))
+    # cell_state = tf.tile(c0, [batch_size, 1])
+    # hidden_state = tf.tile(h0, [batch_size, 1])
+    cell_state = tf.tile(tf.constant(0, dtype=tf.float32, shape=[
+        1, params['state_dim']]), multiples=[batch_size, 1])
+    hidden_state = tf.tile(tf.constant(0, dtype=tf.float32, shape=[
+        1, params['state_dim']]), multiples=[batch_size, 1])
     state = {'state': (cell_state, hidden_state)}
 
     # proj weight
@@ -329,16 +340,24 @@ def model_fn(features, labels, mode, params):
                 tf.cast(tf.argmax(output, axis=1), tf.int32), shape=())
             
             return state['output']
-        predictions = {'predictions': tf.reshape(
-            tf.map_fn(lstm_predict, elems=embeddings, dtype=tf.int32), shape=[1, -1])}
+        predictions = {
+            'predictions': tf.reshape(
+                tf.map_fn(lstm_predict, elems=embeddings, dtype=tf.int32), shape=[1, -1])
+        }
         return tf.estimator.EstimatorSpec(mode=mode, predictions=predictions)
 
     # unroll lstm
     logger.info('LSTM using ground truth.')
-    def lstm_step(current_step):
-        output, state['state'] = lstm(current_step, state['state'])
-        return output
-    output = tf.map_fn(fn=lstm_step, elems=embeddings)
+    # TODO
+    output = []
+    for i in range(params['max_sentence_length']):
+        curr, state['state'] = lstm(embeddings[i], state['state'])
+        output.append(curr)
+    output = tf.stack(output, name='output')
+    # def lstm_step(current_step):
+    #     output, state['state'] = lstm(current_step, state['state'])
+    #     return output
+    # output = tf.map_fn(fn=lstm_step, elems=embeddings, name='output')
 
     # output projection
     output = tf.reshape(output, shape=[-1, params['state_dim']])
@@ -355,10 +374,19 @@ def model_fn(features, labels, mode, params):
     )
 
     # prediction
-    predict_index = tf.argmax(input=logits, axis=2)
+    predict_index = tf.argmax(input=logits, axis=2, name='index')
 
     # loss
-    loss = tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=logits)
+    # TODO
+    # loss = tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=logits)
+    logits_ = tf.transpose(logits, perm=[1, 0, 2])
+    labels_ = tf.transpose(labels)
+    loss = tf.contrib.seq2seq.sequence_loss(
+        logits=logits_,
+        targets=labels_,
+        weights=tf.cast(tf.not_equal(labels_, params['dico'][PAD]), tf.float32),
+        name='loss'
+    )
 
     # training mode
     if mode == tf.estimator.ModeKeys.TRAIN:
@@ -475,6 +503,7 @@ def main():
 
     # build dictionary
     dico = build_dictionary(train_corpus, param)
+    logger.info(dico)
     param.dico = dico
     param.dico_size = len(dico)
 
@@ -510,8 +539,10 @@ def main():
     )
 
     # logging hooks
-    tensors_to_log = {'loss': 'sparse_softmax_cross_entropy_loss/value:0'}
-    logging_hook = tf.train.LoggingTensorHook(tensors=tensors_to_log, every_n_iter=10)
+    # TODO
+    # tensors_to_log = {'loss': 'sparse_softmax_cross_entropy_loss/value:0'}
+    tensors_to_log = {'loss': 'loss/truediv:0', 'index': 'index'}
+    logging_hook = tf.train.LoggingTensorHook(tensors=tensors_to_log, every_n_iter=1)
 
     # training
     logger.info('Start training')
@@ -521,8 +552,11 @@ def main():
     )
 
     # evaluation
+    # TODO
+    tensors_to_log = {'index': 'index'}
+    logging_hook = tf.train.LoggingTensorHook(tensors=tensors_to_log, every_n_iter=1)
     logger.info('Start evaluation')
-    result = language_model.evaluate(input_fn=eval_input_fn)
+    result = language_model.evaluate(input_fn=eval_input_fn, hooks=[logging_hook])
     perplexity = result['perplexity']
     entropy = result['average_entropy']
     np.savetxt('/'.join([param.exp_path, 'eval.perplexity']), perplexity, fmt='%.10f')
@@ -544,7 +578,12 @@ def main():
 
         # predict
         sentences = []
-        for i, result in enumerate(language_model.predict(input_fn=conti_input_fn)):
+        tensors_to_log = {}
+        logging_hook = tf.train.LoggingTensorHook(
+            tensors=tensors_to_log, every_n_iter=1)
+        for i, result in enumerate(language_model.predict(
+            input_fn=conti_input_fn, hooks=[logging_hook])):
+
             result = result['predictions']
             # find EOS position
             eos_pos = 0
@@ -558,6 +597,7 @@ def main():
         with open('/'.join([param.exp_path, 'continuation.txt']), 'w') as f:
             for s in sentences:
                 f.write(' '.join(s)+'\n')
+                logger.debug(' '.join(s))
 
 
 class WarningFilter(logging.Filter):
