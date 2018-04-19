@@ -470,6 +470,10 @@ def main():
     param.dico = dico
     param.dico_size = len(dico)
 
+    # inverse dictionary
+    logger.info('Building inverse dictionary')
+    inverse_dico = {v: k for k, v in dico.items()}
+
     # transform corpus
     train_corpus = transform_corpus(train_corpus, dico, param)
     eval_corpus = transform_corpus(eval_corpus, dico, param)
@@ -516,45 +520,45 @@ def main():
 
             return perplexity, accuracy, predictions
 
-        # training
+        # training & evaluation
         logger.info('Start training')
         for epoch in range(param.n_epoch):
-            logger.info('Start of epoch %d' % (epoch+1))
+            logger.info('Start of epoch %d' % (epoch))
             for batch, idx in batch_generator(train_corpus, param):
                 train_step(batch)
+
+            # evaluation
+            logger.info('Start evaluation for epoch %d' % (epoch))
+            perplexity = np.array([], dtype=np.float)
+            accuracy = 0
+            predictions = None
+            for batch, idx in batch_generator(eval_corpus, param, shuffle=False):
+                ppl, acc, pred = eval_step(batch)
+
+                # aggregate evaluation result
+                perplexity = np.concatenate((perplexity, ppl))
+                accuracy += acc * len(batch)
+                predictions = (np.concatenate((predictions, pred), axis=0)
+                    if predictions is not None else pred)
+
                 if idx % (10 * param.batch_size) == 0:
-                    logger.info('Finish iter %d of training in epoch %d' %
-                        (idx//param.batch_size, epoch))
+                    logger.info('Finish iter %d of evaluation' % (idx//param.batch_size))
+            accuracy = accuracy / len(eval_corpus)
 
-        # evaluation
-        logger.info('Start evaluation')
-        perplexity = np.array([], dtype=np.float)
-        accuracy = 0
-        predictions = None
-        for batch, idx in batch_generator(eval_corpus, param, shuffle=False):
-            ppl, acc, pred = eval_step(batch)
+            logger.info('Evaluation acc: %f' % accuracy)
+            logger.info('Average perplexity: %f' % np.mean(perplexity))
+            np.savetxt('/'.join([param.exp_path, 'eval.ckpt%d.perplexity' % epoch]),
+                perplexity, fmt='%.10f')
 
-            # aggregate evaluation result
-            perplexity = np.concatenate((perplexity, ppl))
-            accuracy += acc * len(batch)
-            predictions = (np.concatenate((predictions, pred), axis=0)
-                if predictions is not None else pred)
-
-            if idx % (10 * param.batch_size) == 0:
-                logger.info('Finish iter %d of evaluation' % (idx//param.batch_size))
-        accuracy = accuracy / len(eval_corpus)
-
-        logger.info('Evaluation acc: %f' % accuracy)
-        logger.info('Average perplexity: %f' % np.mean(perplexity))
-        np.savetxt('/'.join([param.exp_path, 'eval.perplexity']),
-            perplexity, fmt='%.10f')
+            # save predicted sentences
+            with open('/'.join([param.exp_path, 'eval.ckpt%d.prediction'
+                % epoch]), 'w') as f:
+                for prediction in predictions:
+                    f.write(' '.join([inverse_dico[k] for k in prediction])+'\n')
 
         # generation
         if param.conti_corpus is not None:
             logger.info('Sentence continuation start')
-
-            logger.info('Building inverse dictionary')
-            inverse_dico = {v: k for k, v in dico.items()}
 
             # load and transform corpus
             conti_corpus = load_corpus(param.conti_corpus, param)
