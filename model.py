@@ -369,33 +369,36 @@ class RNN(object):
                 tf.reduce_sum(correct_mask, axis=1) /
                 tf.reduce_sum(mask, axis=1))
 
-    def predict(self, sentence):
+        with tf.name_scope('generate'):
+            self.sentence = tf.placeholder(tf.int32, [None, num_steps])
+            batch_size = tf.shape(self.sentence)[0]
 
-        num_steps = self.param.max_sentence_length
-        start_generation = tf.convert_to_tensor(False)
+            start_generation = tf.tile(
+                tf.convert_to_tensor([False]), [batch_size])
 
-        state = (self.h0, self.h0)
-        output = [tf.constant([0])] # sentinel
-        for i in range(num_steps):
-            start_generation = tf.logical_or(start_generation,
-                tf.equal(sentence[0, i], self.param.dico[EOS]))
-            feed_token = tf.cond(start_generation,
-                lambda: output[-1], lambda: sentence[:, i])
-            if i > 0:
-                output[-1] = feed_token
+            state = (tf.tile(self.h0, [batch_size, 1]),
+                     tf.tile(self.h0, [batch_size, 1]))
+            output = [tf.tile(tf.constant([0]), [batch_size])] # sentinel
+            for i in range(num_steps):
+                start_generation = tf.logical_or(start_generation,
+                    tf.equal(self.sentence[:, i], self.param.dico[EOS]))
+                token_mask = tf.cast(start_generation, tf.int32)
+                feed_token = token_mask * \
+                    output[-1] + (1 - token_mask) * self.sentence[:, i]
+                if i > 0:
+                    output[-1] = feed_token
 
-            embedding = tf.nn.embedding_lookup(self.embeddingW, feed_token)
-            embedding = tf.reshape(embedding, [1, self.param.emb_dim])
+                embedding = tf.nn.embedding_lookup(self.embeddingW, feed_token)
 
-            state = self.rnn_cell(embedding, state)
-            hidden = state[1]
+                state = self.rnn_cell(embedding, state)
+                hidden = state[1]
 
-            if self.param.hidden_proj_dim is not None:
-                hidden = tf.matmul(hidden, self.proj_W)
-            logits = tf.matmul(hidden, self.W_softmax) + self.b_softmax
-            output.append(tf.argmax(logits, axis=1, output_type=tf.int32))
+                if self.param.hidden_proj_dim is not None:
+                    hidden = tf.matmul(hidden, self.proj_W)
+                logits = tf.matmul(hidden, self.W_softmax) + self.b_softmax
+                output.append(tf.argmax(logits, axis=1, output_type=tf.int32))
 
-        return tf.stack(output[1:], axis=1)
+            self.generated_sentence = tf.stack(output[1:], axis=1)
 
 
 def main():
@@ -585,25 +588,23 @@ def main():
             conti_corpus = transform_corpus(conti_corpus,
                 dico, param)[:, :-1] # remove extra PAD
 
-            def generation_step(batch):
-                sentence = sess.run(rnn.predict(batch))
-                return sentence
-
             logger.info('Predicting and writing to file')
             with open('/'.join([param.exp_path, 'continuation.txt']), 'w') as f:
                 for batch, idx in batch_generator(conti_corpus, param,
-                    shuffle=False, batch_size=1):
-                    sentence = generation_step(batch)[0]
-                    sentence = list(map(lambda x: inverse_dico[x], sentence))
-                    for i in range(len(sentence)):
-                        if sentence[i] == EOS:
-                            sentence = sentence[:i+1]
-                            break
-                    sentence = sentence[:param.max_conti_length]
-                    sentence = ' '.join(sentence)
-                    f.write(sentence+'\n')
+                    shuffle=False):
+                    sentences = sess.run(rnn.generated_sentence, {
+                                        rnn.sentence: batch})
+                    for sentence in sentences:
+                        sentence = list(map(lambda x: inverse_dico[x], sentence))
+                        for i in range(len(sentence)):
+                            if sentence[i] == EOS:
+                                sentence = sentence[:i+1]
+                                break
+                        sentence = sentence[:param.max_conti_length]
+                        sentence = ' '.join(sentence)
+                        f.write(sentence+'\n')
 
-                    if idx % 10 == 0:
+                    if idx % (10 * param.batch_size) == 0:
                         logger.info('Finish iter %d of generation' % (idx//param.batch_size))
 
 
