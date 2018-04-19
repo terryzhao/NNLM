@@ -415,6 +415,8 @@ def main():
                         help='Path to training corpus')
     parser.add_argument('--eval_corpus', type=str, default='data/sentences.eval',
                         help='Path to evaluation corpus')
+    parser.add_argument('--test_corpus', type=str, default='data/sentences.test',
+                        help='Path to test corpus')
     parser.add_argument('--conti_corpus', type=str, default=None,
                         help='Path to sentence continuation corpus')
     parser.add_argument('--max_line_cnt', type=int, default=None,
@@ -445,6 +447,7 @@ def main():
         assert os.path.exists(param.pretrained)
     assert os.path.exists(param.train_corpus)
     assert os.path.exists(param.eval_corpus)
+    assert os.path.exists(param.test_corpus)
     if param.conti_corpus is not None:
         assert os.path.exists(param.conti_corpus)
     assert param.vocab_size > 4  # <bos>, <eos>, <pad>, <unk>
@@ -464,6 +467,7 @@ def main():
     # load corpus
     train_corpus = load_corpus(param.train_corpus, param)
     eval_corpus = load_corpus(param.eval_corpus, param)
+    test_corpus = load_corpus(param.test_corpus, param)
 
     # build dictionary
     dico = build_dictionary(train_corpus, param)
@@ -477,6 +481,7 @@ def main():
     # transform corpus
     train_corpus = transform_corpus(train_corpus, dico, param)
     eval_corpus = transform_corpus(eval_corpus, dico, param)
+    test_corpus = transform_corpus(test_corpus, dico, param)
 
     with tf.Session() as sess:
         rnn = RNN(param)
@@ -520,19 +525,12 @@ def main():
 
             return perplexity, accuracy, predictions
 
-        # training & evaluation
-        logger.info('Start training')
-        for epoch in range(param.n_epoch):
-            logger.info('Start of epoch %d' % (epoch))
-            for batch, idx in batch_generator(train_corpus, param):
-                train_step(batch)
-
+        def evaluation(corpus, file_prefix):
             # evaluation
-            logger.info('Start evaluation for epoch %d' % (epoch))
             perplexity = np.array([], dtype=np.float)
             accuracy = 0
             predictions = None
-            for batch, idx in batch_generator(eval_corpus, param, shuffle=False):
+            for batch, idx in batch_generator(corpus, param, shuffle=False):
                 ppl, acc, pred = eval_step(batch)
 
                 # aggregate evaluation result
@@ -542,19 +540,41 @@ def main():
                     if predictions is not None else pred)
 
                 if idx % (10 * param.batch_size) == 0:
-                    logger.info('Finish iter %d of evaluation' % (idx//param.batch_size))
-            accuracy = accuracy / len(eval_corpus)
+                    logger.info('Finish iter %d' % (idx//param.batch_size))
+            accuracy = accuracy / len(corpus)
 
-            logger.info('Evaluation acc: %f' % accuracy)
-            logger.info('Average perplexity: %f' % np.mean(perplexity))
-            np.savetxt('/'.join([param.exp_path, 'eval.ckpt%d.perplexity' % epoch]),
+            # save perplexity
+            np.savetxt('/'.join([param.exp_path, '%s.perplexity' % file_prefix]),
                 perplexity, fmt='%.10f')
 
             # save predicted sentences
-            with open('/'.join([param.exp_path, 'eval.ckpt%d.prediction'
-                % epoch]), 'w') as f:
+            with open('/'.join([param.exp_path, '%s.prediction'
+                % file_prefix]), 'w') as f:
                 for prediction in predictions:
                     f.write(' '.join([inverse_dico[k] for k in prediction])+'\n')
+
+            return accuracy, np.mean(perplexity)
+
+        # training & evaluation
+        logger.info('Start training')
+        for epoch in range(param.n_epoch):
+            logger.info('Start of epoch %d' % (epoch))
+            for batch, idx in batch_generator(train_corpus, param):
+                train_step(batch)
+
+            # evaluation
+            logger.info('Start evaluation for epoch %d' % (epoch))
+            acc, ppl = evaluation(eval_corpus, 'eval.ckpt%d' % epoch)
+
+            logger.info('Evaluation acc: %f' % acc)
+            logger.info('Average perplexity: %f' % ppl)
+
+        # test
+        logger.info('Start testing')
+        acc, ppl = evaluation(test_corpus, 'test')
+
+        logger.info('Test acc: %f' % acc)
+        logger.info('Average perplexity: %f' % ppl)
 
         # generation
         if param.conti_corpus is not None:
