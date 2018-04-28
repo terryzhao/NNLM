@@ -44,9 +44,6 @@ def get_logger(path):
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 
-    # log filter
-    logger.addFilter(WarningFilter())
-
     return logger
 
 
@@ -67,12 +64,12 @@ def load_corpus(path, param):
     line_cnt = 0
     with open(path, 'r') as f:
         for line in f:
-            line_cnt += 1
             if (param.max_line_cnt is not None and
                 line_cnt >= param.max_line_cnt):
                 logger.info('Reach maximum line count %d' %
                                   param.max_line_cnt)
                 break
+            line_cnt += 1
 
             tokens = [BOS]
             tokens.extend(line.strip().split())
@@ -81,7 +78,7 @@ def load_corpus(path, param):
             if len(tokens) > param.max_sentence_length:
                 continue
 
-            # extra <PAD> at the end for lstm prediction
+            # extra PAD at the end for lstm prediction
             tokens.extend([PAD] * (param.max_sentence_length + 1 - len(tokens)))
             corpus.append(tokens)
 
@@ -276,10 +273,13 @@ def model_fn(features, labels, mode, params):
     state = {'state': (cell_state, hidden_state)}
 
     # unroll lstm
-    def lstm_step(current_step):
-        output, state['state'] = lstm(current_step, state['state'])
-        return output
-    output = tf.map_fn(fn=lstm_step, elems=embeddings)
+    if mode == tf.estimator.ModeKeys.PREDICT:
+        pass
+    else:
+        def lstm_step(current_step):
+            output, state['state'] = lstm(current_step, state['state'])
+            return output
+        output = tf.map_fn(fn=lstm_step, elems=embeddings)
 
     # output projection
     output = tf.reshape(output, shape=[-1, params['state_dim']])
@@ -289,7 +289,8 @@ def model_fn(features, labels, mode, params):
         output = tf.layers.dense(
             inputs=output,
             units=params['hidden_proj_dim'],
-            activation=tf.nn.relu,
+            activation=None,
+            use_bias=False,
             kernel_initializer=initializer
         )
 
@@ -348,7 +349,10 @@ def model_fn(features, labels, mode, params):
         mask * label_probability, axis=0) /
         tf.reduce_sum(mask, axis=0))
     perplexity = tf.exp(sentence_log_probability, name='perplexity')
-    average_perplexity = tf.metrics.mean(perplexity)
+    # TODO
+    # average_entropy = tf.metrics.mean(
+    #     sentence_log_probability, weights=tf.reduce_sum(mask, axis=0))
+    average_entropy = tf.metrics.mean(loss)
 
     # evaluation mode
     eval_metric_ops = {
@@ -357,7 +361,7 @@ def model_fn(features, labels, mode, params):
             predictions=predictions['index']
         ),
         'perplexity': tf.contrib.metrics.streaming_concat(perplexity),
-        'average_perplexity': average_perplexity
+        'average_entropy': average_entropy
     }
     return tf.estimator.EstimatorSpec(
         mode=mode,
@@ -462,7 +466,7 @@ def main():
     )
 
     # logging hooks
-    tensors_to_log = {'loss': "sparse_softmax_cross_entropy_loss/value:0"}
+    tensors_to_log = {'loss': 'sparse_softmax_cross_entropy_loss/value:0'}
     logging_hook = tf.train.LoggingTensorHook(tensors=tensors_to_log, every_n_iter=10)
 
     # training
@@ -476,7 +480,9 @@ def main():
     logger.info('Start evaluation')
     result = language_model.evaluate(input_fn=eval_input_fn)
     perplexity = result['perplexity']
+    entropy = result['average_entropy']
     np.savetxt('/'.join([param.exp_path, 'eval.perplexity']), perplexity, fmt='%.10f')
+    logger.info('Perplexity is %f' % float(np.exp(entropy)))
 
 
 class WarningFilter(logging.Filter):
